@@ -115,7 +115,9 @@ http://127.0.0.1:8000
 
 The server keeps CSM loaded after the first request, so later turns avoid repeated model-load time. Upload a short reference clip plus its exact transcript in the Voice panel to keep the same reference voice across responses.
 Reference uploads are trimmed to the first 3 seconds by default, so the transcript should match that portion exactly.
-After a reference voice is saved, the server pre-generates cached filler clips in the locked voice. The default auto-play fillers are `sure`, `okay`, and `hmm`; they play immediately while the real CSM response is generating.
+After a reference voice is saved, the server pre-generates cached filler clips in the locked voice. The default auto-play fillers are natural acknowledgement categories such as `sure`, `okay`, `hmm`, `got_it`, and `one_sec`; each category can rotate across multiple rendered clips. `cough` and `sneeze` are generated as named clips but are not auto-played by default.
+
+By default the LLM returns structured voice output with separate `filler` and `speech` fields. The filler is selected from cached audio and is not sent to CSM as part of the answer text. The server also feeds the last generated assistant audio back into CSM as short rolling context, which can improve continuity at the cost of some latency.
 
 Useful API checks:
 
@@ -134,8 +136,20 @@ MAX_TTS_CHUNKS=1 CSM_MAX_NEW_TOKENS=80 MAX_SPOKEN_WORDS=10 REFERENCE_SECONDS=3 .
 To change cached filler text or auto-play rotation:
 
 ```bash
-CANNED_FILLERS="sure=Sure.|okay=Okay.|hmm=Hmm.|sorry=Sorry.|cough=Cough.|sneeze=Achoo."
-CANNED_AUTO_FILLERS=sure,okay,hmm
+CANNED_FILLERS="sure_1=Sure.|sure_2=Yeah.|hmm_1=Hmm.|one_sec_1=One sec.|sorry_1=Sorry."
+CANNED_AUTO_FILLERS=sure,hmm,one_sec
+```
+
+To disable the extra CSM audio context for lower latency:
+
+```bash
+CSM_AUDIO_CONTEXT_TURNS=0 ./scripts/run_server.sh
+```
+
+To return to token-by-token LLM text streaming instead of structured filler selection:
+
+```bash
+STRUCTURED_VOICE_OUTPUT=0 ./scripts/run_server.sh
 ```
 
 ## Voice-In MVP

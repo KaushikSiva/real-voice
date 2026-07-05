@@ -38,6 +38,7 @@ class CsmTts:
         reference_text: str | None = None,
         speaker: str | None = None,
         max_new_tokens: int | None = None,
+        context_segments: list[dict[str, Any]] | None = None,
     ) -> Path:
         if self.processor is None or self.model is None:
             raise RuntimeError("CSM model is not loaded.")
@@ -47,6 +48,7 @@ class CsmTts:
             reference_audio=reference_audio,
             reference_text=reference_text,
             speaker=speaker,
+            context_segments=context_segments,
         )
         inputs = self.processor.apply_chat_template(
             conversation,
@@ -130,6 +132,7 @@ class CsmTts:
         reference_audio: Path | None = None,
         reference_text: str | None = None,
         speaker: str | None = None,
+        context_segments: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         active_reference_audio = reference_audio or self.reference_audio
         active_reference_text = reference_text or self.reference_text
@@ -143,6 +146,24 @@ class CsmTts:
                     "content": [
                         {"type": "text", "text": active_reference_text},
                         {"type": "audio", "path": audio},
+                    ],
+                }
+            )
+
+        for segment in context_segments or []:
+            segment_text = str(segment.get("text", "")).strip()
+            segment_audio = segment.get("audio_path")
+            if not segment_text or not segment_audio:
+                continue
+            audio_path = Path(segment_audio)
+            if not audio_path.exists():
+                continue
+            conversation.append(
+                {
+                    "role": str(segment.get("speaker", active_speaker)),
+                    "content": [
+                        {"type": "text", "text": segment_text},
+                        {"type": "audio", "path": _load_audio_24khz(audio_path)},
                     ],
                 }
             )

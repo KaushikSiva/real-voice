@@ -33,7 +33,14 @@ REFERENCE_RAW = STATE_DIR / "reference_upload"
 REFERENCE_WAV = STATE_DIR / "reference_24k.wav"
 REFERENCE_TEXT = STATE_DIR / "reference.txt"
 CANNED_DIR = STATE_DIR / "canned"
-DEFAULT_CANNED_FILLERS = "sure=Sure.|okay=Okay.|hmm=Hmm.|sorry=Sorry.|cough=Cough.|sneeze=Achoo."
+DEFAULT_CANNED_FILLERS = (
+    "sure_1=Sure.|sure_2=Yeah.|sure_3=Yep.|"
+    "okay_1=Okay.|okay_2=Alright.|got_it_1=Got it.|"
+    "hmm_1=Hmm.|hmm_2=Let me think.|one_sec_1=One sec.|"
+    "sorry_1=Sorry.|cough_1=Cough.|sneeze_1=Achoo."
+)
+DEFAULT_CANNED_AUTO_FILLERS = "sure,okay,hmm,got_it,one_sec"
+FILLER_CHOICES = {"sure", "okay", "hmm", "got_it", "one_sec", "sorry", "none"}
 
 
 @dataclass(frozen=True)
@@ -60,8 +67,18 @@ class AssistantConfig:
     canned_enabled: bool = os.getenv("CANNED_FILLERS_ENABLED", "1") != "0"
     canned_auto_build: bool = os.getenv("CANNED_FILLERS_AUTO_BUILD", "1") != "0"
     canned_fillers: str = os.getenv("CANNED_FILLERS", DEFAULT_CANNED_FILLERS)
-    canned_auto_fillers: str = os.getenv("CANNED_AUTO_FILLERS", "sure,okay,hmm")
+    canned_auto_fillers: str = os.getenv("CANNED_AUTO_FILLERS", DEFAULT_CANNED_AUTO_FILLERS)
     canned_max_new_tokens: int = int(os.getenv("CANNED_MAX_NEW_TOKENS", "48"))
+    canned_trailing_silence_ms: int = int(os.getenv("CANNED_TRAILING_SILENCE_MS", "180"))
+    structured_voice_output: bool = os.getenv("STRUCTURED_VOICE_OUTPUT", "1") != "0"
+    audio_context_turns: int = int(os.getenv("CSM_AUDIO_CONTEXT_TURNS", "1"))
+
+
+@dataclass(frozen=True)
+class AudioContextSegment:
+    speaker: str
+    text: str
+    audio_path: Path
 
 
 class ChatRequest(BaseModel):
@@ -82,6 +99,8 @@ class VoiceAssistantService:
         self._tts_lock = threading.Lock()
         self._sessions: dict[str, list[dict[str, str]]] = {}
         self._session_lock = threading.Lock()
+        self._audio_contexts: dict[str, list[AudioContextSegment]] = {}
+        self._audio_context_lock = threading.Lock()
         self._canned_lock = threading.Lock()
         self._canned_building = False
         self._canned_error: str | None = None
@@ -106,6 +125,8 @@ class VoiceAssistantService:
             "voice_locked": self.voice_locked,
             "reference_text": self.reference_text or "",
             "canned_fillers": self.canned_status(),
+            "structured_voice_output": self.config.structured_voice_output,
+            "audio_context_turns": self.config.audio_context_turns,
         }
 
     @property
@@ -209,12 +230,14 @@ class VoiceAssistantService:
                 self._canned_building = False
         return self.canned_status()
 
-    def next_canned_filler(self) -> dict[str, object] | None:
+    def next_canned_filler(self, category: str | None = None) -> dict[str, object] | None:
         if not self.config.canned_enabled or not self.voice_locked:
             return None
 
         ready = set(self._ready_canned_names())
-        choices = [name for name in self._auto_canned_names() if name in ready]
+        selectors = [_safe_audio_name(category)] if category else self._auto_canned_names()
+        selectors = [selector for selector in selectors if selector and selector != "none"]
+        choices = self._matching_canned_names(selectors, ready)
         if not choices:
             return None
 
@@ -238,6 +261,10 @@ class VoiceAssistantService:
 
         session = session_id or uuid.uuid4().hex
         started = time.perf_counter()
+        if self.config.structured_voice_output:
+            yield from self._stream_structured_chat_events(clean_text, session, started)
+            return
+
         messages = self._messages_for_session(session, clean_text)
         response_parts: list[str] = []
         chunker = SentenceChunker(min_chars=90)
@@ -280,6 +307,7 @@ class VoiceAssistantService:
                     filename = f"{session}_{stamp}_{index:02d}.wav"
                     output_path = OUTPUT_DIR / filename
                     chunk_started = time.perf_counter()
+                    context_segments = self._audio_context_segments_for_session(session)
                     with self._tts_lock:
                         tts.synthesize(
                             chunk,
@@ -288,7 +316,9 @@ class VoiceAssistantService:
                             reference_text=self.reference_text,
                             speaker=self.config.speaker,
                             max_new_tokens=self.config.max_new_tokens,
+                            context_segments=context_segments,
                         )
+                    self._append_audio_context(session, chunk, output_path)
                     event_queue.put(
                         {
                             "type": "audio",
@@ -359,6 +389,80 @@ class VoiceAssistantService:
             work_queue.put(None)
             yield _sse("error", {"message": str(exc)})
 
+    def _stream_structured_chat_events(self, clean_text: str, session: str, started: float) -> Iterator[str]:
+        yield _sse("start", {"session_id": session, "input_text": clean_text})
+
+        llm_started = time.perf_counter()
+        try:
+            raw_response = self.ollama.chat_messages(
+                model=self.config.ollama_model,
+                messages=self._structured_messages_for_session(session, clean_text),
+                temperature=0.35,
+            )
+            llm_seconds = time.perf_counter() - llm_started
+            filler_category, speech = _parse_structured_voice_response(raw_response)
+            if not speech:
+                speech = "Sorry, I missed that."
+                filler_category = "sorry"
+
+            speech = _clip_words(speech, self.config.max_spoken_words)
+            filler = self.next_canned_filler(filler_category)
+            if filler is not None:
+                yield _sse("filler", filler)
+
+            yield _sse("text", {"delta": speech})
+
+            chunks = self._chunks_for_tts(speech)
+            tts_started = time.perf_counter() if chunks else None
+            tts = self._ensure_tts()
+            for index, chunk in enumerate(chunks, 1):
+                yield _sse("tts_queued", {"index": index, "text": chunk})
+                stamp = int(time.time() * 1000)
+                filename = f"{session}_{stamp}_{index:02d}.wav"
+                output_path = OUTPUT_DIR / filename
+                context_segments = self._audio_context_segments_for_session(session)
+                chunk_started = time.perf_counter()
+                with self._tts_lock:
+                    tts.synthesize(
+                        chunk,
+                        output_path,
+                        reference_audio=self.reference_audio,
+                        reference_text=self.reference_text,
+                        speaker=self.config.speaker,
+                        max_new_tokens=self.config.max_new_tokens,
+                        context_segments=context_segments,
+                    )
+                self._append_audio_context(session, chunk, output_path)
+                yield _sse(
+                    "audio",
+                    {
+                        "index": index,
+                        "text": chunk,
+                        "url": f"/audio/{filename}",
+                        "seconds": round(time.perf_counter() - chunk_started, 3),
+                    },
+                )
+
+            self._append_session(session, clean_text, speech)
+            tts_seconds = 0.0 if tts_started is None else time.perf_counter() - tts_started
+            yield _sse(
+                "done",
+                {
+                    "session_id": session,
+                    "response_text": speech,
+                    "timings": {
+                        "llm_seconds": round(llm_seconds, 3),
+                        "tts_seconds": round(tts_seconds, 3),
+                        "total_seconds": round(time.perf_counter() - started, 3),
+                    },
+                    "voice_locked": self.voice_locked,
+                    "filler": filler_category,
+                    "audio_context_turns": self.config.audio_context_turns,
+                },
+            )
+        except BaseException as exc:
+            yield _sse("error", {"message": str(exc)})
+
     def chat(self, text: str, session_id: str | None = None) -> dict[str, object]:
         clean_text = text.strip()
         if not clean_text:
@@ -371,9 +475,17 @@ class VoiceAssistantService:
         llm_started = time.perf_counter()
         response = self.ollama.chat_messages(
             model=self.config.ollama_model,
-            messages=messages,
+            messages=self._structured_messages_for_session(session, clean_text)
+            if self.config.structured_voice_output
+            else messages,
             temperature=0.4,
         )
+        filler_category = "none"
+        if self.config.structured_voice_output:
+            filler_category, response = _parse_structured_voice_response(response)
+            if not response:
+                response = "Sorry, I missed that."
+                filler_category = "sorry"
         llm_seconds = time.perf_counter() - llm_started
 
         chunks = self._chunks_for_tts(response)
@@ -394,6 +506,7 @@ class VoiceAssistantService:
                 "total_seconds": round(time.perf_counter() - started, 3),
             },
             "voice_locked": self.voice_locked,
+            "filler": filler_category,
         }
 
     def transcribe_and_chat(self, upload: UploadFile, session_id: str | None = None) -> dict[str, object]:
@@ -454,6 +567,21 @@ class VoiceAssistantService:
             history = list(self._sessions.get(session_id, []))[-self.config.max_history_messages :]
         return [{"role": "system", "content": self.config.system_prompt}, *history, {"role": "user", "content": user_text}]
 
+    def _structured_messages_for_session(self, session_id: str, user_text: str) -> list[dict[str, str]]:
+        structured_prompt = (
+            f"{self.config.system_prompt}\n\n"
+            "Return only valid JSON with exactly these keys: filler, speech.\n"
+            "filler must be one of: sure, okay, hmm, got_it, one_sec, sorry, none.\n"
+            "Use sure/okay/got_it for tasks or confirmations, hmm/one_sec when thinking, "
+            "sorry only for errors or inability, none when no acknowledgement is needed.\n"
+            "speech is the actual spoken answer. Do not include the filler word in speech.\n"
+            "speech must be natural spoken English, no markdown, no lists, no preamble, "
+            f"and at most {self.config.max_spoken_words} words unless the user explicitly asks for detail."
+        )
+        with self._session_lock:
+            history = list(self._sessions.get(session_id, []))[-self.config.max_history_messages :]
+        return [{"role": "system", "content": structured_prompt}, *history, {"role": "user", "content": user_text}]
+
     def _append_session(self, session_id: str, user_text: str, response: str) -> None:
         with self._session_lock:
             history = self._sessions.setdefault(session_id, [])
@@ -464,6 +592,34 @@ class VoiceAssistantService:
                 ]
             )
             del history[: max(0, len(history) - self.config.max_history_messages)]
+
+    def _audio_context_segments_for_session(self, session_id: str) -> list[dict[str, object]]:
+        if self.config.audio_context_turns <= 0:
+            return []
+        with self._audio_context_lock:
+            segments = list(self._audio_contexts.get(session_id, []))[-self.config.audio_context_turns :]
+        return [
+            {
+                "speaker": segment.speaker,
+                "text": segment.text,
+                "audio_path": segment.audio_path,
+            }
+            for segment in segments
+            if segment.audio_path.exists()
+        ]
+
+    def _append_audio_context(self, session_id: str, text: str, audio_path: Path) -> None:
+        if self.config.audio_context_turns <= 0:
+            return
+        segment = AudioContextSegment(
+            speaker=self.config.speaker,
+            text=text.strip(),
+            audio_path=audio_path,
+        )
+        with self._audio_context_lock:
+            segments = self._audio_contexts.setdefault(session_id, [])
+            segments.append(segment)
+            del segments[: max(0, len(segments) - self.config.audio_context_turns)]
 
     def _chunks_for_tts(self, text: str) -> list[str]:
         chunker = SentenceChunker(min_chars=110)
@@ -481,6 +637,7 @@ class VoiceAssistantService:
             for index, chunk in enumerate(chunks, 1):
                 filename = f"{session_id}_{stamp}_{index:02d}.wav"
                 output_path = OUTPUT_DIR / filename
+                context_segments = self._audio_context_segments_for_session(session_id)
                 tts.synthesize(
                     chunk,
                     output_path,
@@ -488,7 +645,9 @@ class VoiceAssistantService:
                     reference_text=self.reference_text,
                     speaker=self.config.speaker,
                     max_new_tokens=self.config.max_new_tokens,
+                    context_segments=context_segments,
                 )
+                self._append_audio_context(session_id, chunk, output_path)
                 urls.append(f"/audio/{filename}")
         return urls
 
@@ -520,6 +679,7 @@ class VoiceAssistantService:
                     speaker=self.config.speaker,
                     max_new_tokens=self.config.canned_max_new_tokens,
                 )
+            _append_trailing_silence(output_path, self.config.canned_trailing_silence_ms)
             metadata[name] = {
                 "text": text,
                 "seconds": round(time.perf_counter() - started, 3),
@@ -548,6 +708,15 @@ class VoiceAssistantService:
             if (CANNED_DIR / f"{name}.wav").exists():
                 names.append(name)
         return names
+
+    def _matching_canned_names(self, selectors: list[str], ready: set[str]) -> list[str]:
+        matches: list[str] = []
+        configured_names = [name for name, _text in self._configured_canned_fillers()]
+        for selector in selectors:
+            for name in configured_names:
+                if name in ready and (name == selector or name.startswith(f"{selector}_")) and name not in matches:
+                    matches.append(name)
+        return matches
 
 
 config = AssistantConfig()
@@ -686,3 +855,54 @@ def _clip_words(text: str, max_words: int) -> str:
 
 def _safe_audio_name(name: str) -> str:
     return re.sub(r"[^a-z0-9_-]+", "", name.strip().lower())
+
+
+def _parse_structured_voice_response(raw_response: str) -> tuple[str, str]:
+    raw = raw_response.strip()
+    payload: object
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return "none", _clean_speech_text(raw)
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return "none", _clean_speech_text(raw)
+
+    if not isinstance(payload, dict):
+        return "none", _clean_speech_text(raw)
+
+    filler = _safe_audio_name(str(payload.get("filler", "none")))
+    if filler not in FILLER_CHOICES:
+        filler = "none"
+    speech = _clean_speech_text(str(payload.get("speech", "")))
+    return filler, speech
+
+
+def _clean_speech_text(text: str) -> str:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    return cleaned.strip('"').strip()
+
+
+def _append_trailing_silence(path: Path, silence_ms: int) -> None:
+    if silence_ms <= 0:
+        return
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        audio, sample_rate = sf.read(path, dtype="float32", always_2d=False)
+        silence_frames = int(sample_rate * silence_ms / 1000)
+        if silence_frames <= 0:
+            return
+        if getattr(audio, "ndim", 1) == 2:
+            silence = np.zeros((silence_frames, audio.shape[1]), dtype=np.float32)
+        else:
+            silence = np.zeros(silence_frames, dtype=np.float32)
+        sf.write(path, np.concatenate([audio, silence]), sample_rate)
+    except Exception:
+        return

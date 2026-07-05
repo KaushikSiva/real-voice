@@ -172,11 +172,14 @@ CSM_MAX_NEW_TOKENS=80
 MAX_SPOKEN_WORDS=10
 REFERENCE_SECONDS=3
 
+STRUCTURED_VOICE_OUTPUT=1
+CSM_AUDIO_CONTEXT_TURNS=1
 CANNED_FILLERS_ENABLED=1
 CANNED_FILLERS_AUTO_BUILD=1
-CANNED_FILLERS="sure=Sure.|okay=Okay.|hmm=Hmm.|sorry=Sorry.|cough=Cough.|sneeze=Achoo."
-CANNED_AUTO_FILLERS=sure,okay,hmm
+CANNED_FILLERS="sure_1=Sure.|sure_2=Yeah.|sure_3=Yep.|okay_1=Okay.|okay_2=Alright.|got_it_1=Got it.|hmm_1=Hmm.|hmm_2=Let me think.|one_sec_1=One sec.|sorry_1=Sorry.|cough_1=Cough.|sneeze_1=Achoo."
+CANNED_AUTO_FILLERS=sure,okay,hmm,got_it,one_sec
 CANNED_MAX_NEW_TOKENS=48
+CANNED_TRAILING_SILENCE_MS=180
 
 NO_TORCH_COMPILE=1
 PYTORCH_ENABLE_MPS_FALLBACK=1
