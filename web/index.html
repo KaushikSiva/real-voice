@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CSM Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <canvas id="signal" aria-hidden="true"></canvas>
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Local voice assistant</p>
+          <h1>CSM Console</h1>
+        </div>
+        <div class="status-strip" aria-live="polite">
+          <span id="modelStatus" class="status">Model cold</span>
+          <span id="voiceStatus" class="status">Voice default</span>
+        </div>
+      </header>
+
+      <section class="layout">
+        <section class="conversation" aria-label="Conversation">
+          <div id="messages" class="messages">
+            <article class="message assistant">
+              <span>Assistant</span>
+              <p>Ready.</p>
+            </article>
+          </div>
+
+          <form id="chatForm" class="composer">
+            <textarea
+              id="textInput"
+              rows="2"
+              autocomplete="off"
+              placeholder="Ask something"
+            ></textarea>
+            <div class="composer-actions">
+              <button id="recordBtn" class="button secondary" type="button" title="Record microphone">
+                Record
+              </button>
+              <button id="sendBtn" class="button primary" type="submit">Send</button>
+            </div>
+          </form>
+        </section>
+
+        <aside class="side" aria-label="Voice controls">
+          <section class="voice-panel">
+            <div class="section-head">
+              <h2>Voice</h2>
+              <button id="warmBtn" class="button ghost" type="button">Warm</button>
+            </div>
+            <form id="referenceForm" class="reference-form">
+              <label class="file-row">
+                <span>Reference clip</span>
+                <input id="referenceAudio" name="audio" type="file" accept="audio/*" />
+              </label>
+              <label class="stack">
+                <span>Transcript</span>
+                <textarea
+                  id="referenceText"
+                  name="transcript"
+                  rows="4"
+                  placeholder="Words spoken in the first four seconds"
+                ></textarea>
+              </label>
+              <button class="button primary wide" type="submit">Save voice</button>
+            </form>
+          </section>
+
+          <section class="queue-panel">
+            <div class="section-head">
+              <h2>Audio</h2>
+              <span id="timingText" class="muted">Idle</span>
+            </div>
+            <div id="audioQueue" class="queue"></div>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

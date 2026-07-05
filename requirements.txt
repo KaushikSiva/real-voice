@@ -1,0 +1,13 @@
+# Python 3.12 recommended on macOS.
+accelerate>=0.31
+fastapi>=0.115
+huggingface_hub>=0.23
+numpy>=1.26
+openai-whisper>=20240930
+python-multipart>=0.0.9
+requests>=2.31
+soundfile>=0.12
+torch>=2.3
+transformers>=4.52.1
+uvicorn[standard]>=0.30
+
