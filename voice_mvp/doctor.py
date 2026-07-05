@@ -104,7 +104,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         ok("python version", "3.12")
 
-    for executable in ("ffmpeg", "afplay", "ollama"):
+    executables = ["ffmpeg", "ollama"]
+    if platform.system() == "Darwin":
+        executables.append("afplay")
+
+    for executable in executables:
         path = shutil.which(executable)
         if path:
             ok(executable, path)
@@ -143,4 +147,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

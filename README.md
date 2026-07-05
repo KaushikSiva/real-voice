@@ -35,6 +35,60 @@ For a deeper Hugging Face/CSM check:
 ./scripts/doctor.py --check-csm-download
 ```
 
+## CUDA VM Setup
+
+On a fresh NVIDIA VM, clone the repo and run the Linux/CUDA setup script:
+
+```bash
+git clone https://github.com/KaushikSiva/real-voice.git
+cd real-voice
+./scripts/setup_vm_cuda.sh
+```
+
+For non-interactive Hugging Face login:
+
+```bash
+HF_TOKEN=hf_your_read_token ./scripts/setup_vm_cuda.sh
+```
+
+The script installs system packages, creates `.venv`, installs Python dependencies, installs/starts Ollama, pulls `llama3.2:3b`, writes CUDA defaults to `.env`, checks Hugging Face access for `sesame/csm-1b`, and preloads CSM once so failures happen during setup instead of the first browser request.
+
+Start the server:
+
+```bash
+./scripts/run_server.sh
+```
+
+Open the UI:
+
+```text
+http://<VM_PUBLIC_IP>:8000
+```
+
+Browser microphone input requires `localhost` or HTTPS. The fastest GPU-VM workflow is an SSH tunnel from your laptop:
+
+```bash
+ssh -i ~/.ssh/real_voice_h200 -L 8000:127.0.0.1:8000 <user>@<VM_PUBLIC_IP>
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000
+```
+
+If you have a real domain pointed at the VM and ports 80/443 are open, the setup script can configure Caddy:
+
+```bash
+INSTALL_CADDY=1 PUBLIC_DOMAIN=voice.example.com ./scripts/setup_vm_cuda.sh
+```
+
+To also install the app as a systemd service:
+
+```bash
+INSTALL_APP_SERVICE=1 ./scripts/setup_vm_cuda.sh
+```
+
 ## Text-In MVP
 
 This skips Whisper and sends typed text directly to Ollama:
