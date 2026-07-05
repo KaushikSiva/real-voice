@@ -115,18 +115,27 @@ http://127.0.0.1:8000
 
 The server keeps CSM loaded after the first request, so later turns avoid repeated model-load time. Upload a short reference clip plus its exact transcript in the Voice panel to keep the same reference voice across responses.
 Reference uploads are trimmed to the first 3 seconds by default, so the transcript should match that portion exactly.
+After a reference voice is saved, the server pre-generates cached filler clips in the locked voice. The default auto-play fillers are `sure`, `okay`, and `hmm`; they play immediately while the real CSM response is generating.
 
 Useful API checks:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/status
 curl -s -X POST http://127.0.0.1:8000/api/warmup
+curl -s -X POST http://127.0.0.1:8000/api/canned/rebuild
 ```
 
 Latency-oriented defaults can be overridden:
 
 ```bash
 MAX_TTS_CHUNKS=1 CSM_MAX_NEW_TOKENS=80 MAX_SPOKEN_WORDS=10 REFERENCE_SECONDS=3 ./scripts/run_server.sh
+```
+
+To change cached filler text or auto-play rotation:
+
+```bash
+CANNED_FILLERS="sure=Sure.|okay=Okay.|hmm=Hmm.|sorry=Sorry.|cough=Cough.|sneeze=Achoo."
+CANNED_AUTO_FILLERS=sure,okay,hmm
 ```
 
 ## Voice-In MVP

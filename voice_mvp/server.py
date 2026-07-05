@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import queue
+import re
 import shutil
 import threading
 import time
@@ -31,6 +32,8 @@ STATE_DIR = ROOT / "state"
 REFERENCE_RAW = STATE_DIR / "reference_upload"
 REFERENCE_WAV = STATE_DIR / "reference_24k.wav"
 REFERENCE_TEXT = STATE_DIR / "reference.txt"
+CANNED_DIR = STATE_DIR / "canned"
+DEFAULT_CANNED_FILLERS = "sure=Sure.|okay=Okay.|hmm=Hmm.|sorry=Sorry.|cough=Cough.|sneeze=Achoo."
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,11 @@ class AssistantConfig:
     max_spoken_words: int = int(os.getenv("MAX_SPOKEN_WORDS", "10"))
     reference_seconds: float = float(os.getenv("REFERENCE_SECONDS", "3"))
     auto_warmup: bool = os.getenv("AUTO_WARMUP", "1") != "0"
+    canned_enabled: bool = os.getenv("CANNED_FILLERS_ENABLED", "1") != "0"
+    canned_auto_build: bool = os.getenv("CANNED_FILLERS_AUTO_BUILD", "1") != "0"
+    canned_fillers: str = os.getenv("CANNED_FILLERS", DEFAULT_CANNED_FILLERS)
+    canned_auto_fillers: str = os.getenv("CANNED_AUTO_FILLERS", "sure,okay,hmm")
+    canned_max_new_tokens: int = int(os.getenv("CANNED_MAX_NEW_TOKENS", "48"))
 
 
 class ChatRequest(BaseModel):
@@ -74,8 +82,13 @@ class VoiceAssistantService:
         self._tts_lock = threading.Lock()
         self._sessions: dict[str, list[dict[str, str]]] = {}
         self._session_lock = threading.Lock()
+        self._canned_lock = threading.Lock()
+        self._canned_building = False
+        self._canned_error: str | None = None
+        self._canned_cursor = 0
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+        CANNED_DIR.mkdir(parents=True, exist_ok=True)
 
     def status(self) -> dict[str, object]:
         models = []
@@ -92,6 +105,7 @@ class VoiceAssistantService:
             "tts_loaded": self._tts is not None,
             "voice_locked": self.voice_locked,
             "reference_text": self.reference_text or "",
+            "canned_fillers": self.canned_status(),
         }
 
     @property
@@ -130,10 +144,90 @@ class VoiceAssistantService:
             max_duration=self.config.reference_seconds,
         )
         REFERENCE_TEXT.write_text(clean_transcript, encoding="utf-8")
+        self.clear_canned_fillers()
+        if self.config.canned_auto_build:
+            self.build_canned_fillers_async()
         return {
             "voice_locked": True,
             "reference_audio": str(REFERENCE_WAV),
             "reference_text": clean_transcript,
+            "canned_building": self.canned_status()["building"],
+        }
+
+    def canned_status(self) -> dict[str, object]:
+        with self._canned_lock:
+            building = self._canned_building
+            error = self._canned_error
+        ready = self._ready_canned_names()
+        return {
+            "enabled": self.config.canned_enabled,
+            "building": building,
+            "ready": ready,
+            "auto": self._auto_canned_names(),
+            "error": error or "",
+        }
+
+    def clear_canned_fillers(self) -> None:
+        CANNED_DIR.mkdir(parents=True, exist_ok=True)
+        for path in CANNED_DIR.iterdir():
+            if path.is_file() and path.suffix in {".wav", ".json"}:
+                path.unlink()
+
+    def build_canned_fillers_async(self) -> None:
+        if not self.config.canned_enabled or not self.voice_locked:
+            return
+        if not self._claim_canned_build():
+            return
+
+        def run() -> None:
+            try:
+                self._build_canned_fillers_claimed()
+            except BaseException as exc:
+                with self._canned_lock:
+                    self._canned_error = str(exc)
+            finally:
+                with self._canned_lock:
+                    self._canned_building = False
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def rebuild_canned_fillers(self) -> dict[str, object]:
+        if not self.config.canned_enabled:
+            return self.canned_status()
+        if not self.voice_locked:
+            raise ValueError("Save a reference voice before building canned fillers.")
+        if not self._claim_canned_build():
+            return self.canned_status()
+        try:
+            self._build_canned_fillers_claimed()
+        except BaseException as exc:
+            with self._canned_lock:
+                self._canned_error = str(exc)
+            raise
+        finally:
+            with self._canned_lock:
+                self._canned_building = False
+        return self.canned_status()
+
+    def next_canned_filler(self) -> dict[str, object] | None:
+        if not self.config.canned_enabled or not self.voice_locked:
+            return None
+
+        ready = set(self._ready_canned_names())
+        choices = [name for name in self._auto_canned_names() if name in ready]
+        if not choices:
+            return None
+
+        with self._canned_lock:
+            name = choices[self._canned_cursor % len(choices)]
+            self._canned_cursor += 1
+
+        path = CANNED_DIR / f"{name}.wav"
+        text = dict(self._configured_canned_fillers()).get(name, name)
+        return {
+            "name": name,
+            "text": text,
+            "url": f"/canned/{path.name}",
         }
 
     def stream_chat_events(self, text: str, session_id: str | None = None) -> Iterator[str]:
@@ -155,6 +249,9 @@ class VoiceAssistantService:
         saw_tts_done = False
 
         yield _sse("start", {"session_id": session, "input_text": clean_text})
+        filler = self.next_canned_filler()
+        if filler is not None:
+            yield _sse("filler", filler)
 
         def enqueue_chunk(chunk: str) -> None:
             nonlocal chunk_count, spoken_word_count, tts_started
@@ -395,6 +492,63 @@ class VoiceAssistantService:
                 urls.append(f"/audio/{filename}")
         return urls
 
+    def _claim_canned_build(self) -> bool:
+        with self._canned_lock:
+            if self._canned_building:
+                return False
+            self._canned_building = True
+            self._canned_error = None
+            return True
+
+    def _build_canned_fillers_claimed(self) -> None:
+        fillers = self._configured_canned_fillers()
+        if not fillers:
+            return
+
+        self.clear_canned_fillers()
+        metadata: dict[str, dict[str, object]] = {}
+        tts = self._ensure_tts()
+        for name, text in fillers:
+            output_path = CANNED_DIR / f"{name}.wav"
+            started = time.perf_counter()
+            with self._tts_lock:
+                tts.synthesize(
+                    text,
+                    output_path,
+                    reference_audio=self.reference_audio,
+                    reference_text=self.reference_text,
+                    speaker=self.config.speaker,
+                    max_new_tokens=self.config.canned_max_new_tokens,
+                )
+            metadata[name] = {
+                "text": text,
+                "seconds": round(time.perf_counter() - started, 3),
+                "filename": output_path.name,
+            }
+        (CANNED_DIR / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    def _configured_canned_fillers(self) -> list[tuple[str, str]]:
+        fillers: list[tuple[str, str]] = []
+        for item in self.config.canned_fillers.split("|"):
+            if "=" not in item:
+                continue
+            raw_name, raw_text = item.split("=", 1)
+            name = _safe_audio_name(raw_name)
+            text = raw_text.strip()
+            if name and text:
+                fillers.append((name, text))
+        return fillers
+
+    def _auto_canned_names(self) -> list[str]:
+        return [_safe_audio_name(name) for name in self.config.canned_auto_fillers.split(",") if _safe_audio_name(name)]
+
+    def _ready_canned_names(self) -> list[str]:
+        names = []
+        for name, _text in self._configured_canned_fillers():
+            if (CANNED_DIR / f"{name}.wav").exists():
+                names.append(name)
+        return names
+
 
 config = AssistantConfig()
 service = VoiceAssistantService(config)
@@ -438,6 +592,14 @@ def set_reference(
 ) -> dict[str, object]:
     try:
         return service.set_reference(audio, transcript)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/canned/rebuild")
+def rebuild_canned() -> dict[str, object]:
+    try:
+        return service.rebuild_canned_fillers()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -495,6 +657,15 @@ def audio(filename: str) -> FileResponse:
     return FileResponse(path, media_type="audio/wav")
 
 
+@app.get("/canned/{filename}")
+def canned(filename: str) -> FileResponse:
+    canned_root = CANNED_DIR.resolve()
+    path = (CANNED_DIR / filename).resolve()
+    if not path.exists() or path.parent != canned_root or path.suffix != ".wav":
+        raise HTTPException(status_code=404, detail="Canned audio file not found.")
+    return FileResponse(path, media_type="audio/wav")
+
+
 def _sse(event: str, data: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
@@ -511,3 +682,7 @@ def _clip_words(text: str, max_words: int) -> str:
     if clipped and clipped[-1] not in ".!?":
         clipped += "."
     return clipped
+
+
+def _safe_audio_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9_-]+", "", name.strip().lower())

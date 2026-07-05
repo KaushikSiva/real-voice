@@ -82,11 +82,11 @@ function clearAudioRows() {
   els.audioQueue.replaceChildren();
 }
 
-function addAudioRow(url, index, seconds) {
+function addAudioRow(url, labelText, seconds) {
   const row = document.createElement("div");
   row.className = "queue-row";
   const label = document.createElement("span");
-  label.textContent = `Chunk ${index}`;
+  label.textContent = labelText;
   const link = document.createElement("a");
   link.href = url;
   link.textContent = seconds ? `${seconds}s` : "WAV";
@@ -101,10 +101,20 @@ async function refreshStatus() {
     const data = await response.json();
     els.modelStatus.textContent = data.tts_loaded ? "Model warm" : "Model cold";
     els.modelStatus.classList.toggle("ready", Boolean(data.tts_loaded));
-    els.voiceStatus.textContent = data.voice_locked ? "Voice locked" : "Voice default";
+    const fillers = data.canned_fillers || {};
+    if (data.voice_locked && fillers.ready && fillers.ready.length > 0) {
+      els.voiceStatus.textContent = `Voice locked + ${fillers.ready.length} fillers`;
+    } else if (data.voice_locked && fillers.building) {
+      els.voiceStatus.textContent = "Voice locked + building";
+    } else {
+      els.voiceStatus.textContent = data.voice_locked ? "Voice locked" : "Voice default";
+    }
     els.voiceStatus.classList.toggle("ready", Boolean(data.voice_locked));
     if (data.reference_text && !els.referenceText.value) {
       els.referenceText.value = data.reference_text;
+    }
+    if (fillers.building) {
+      window.setTimeout(refreshStatus, 2500);
     }
   } catch {
     els.modelStatus.textContent = "Server offline";
@@ -175,13 +185,17 @@ async function streamText(text, addUserMessage = true) {
       if (type === "start") {
         state.sessionId = data.session_id;
         localStorage.setItem("csm-session-id", state.sessionId);
+      } else if (type === "filler") {
+        addAudioRow(data.url, `Filler ${data.name}`, null);
+        setStatus(`Playing ${data.name}`);
+        enqueuePlayback(data.url);
       } else if (type === "text") {
         if (!assistantMessage) assistantMessage = addMessage("Assistant", "");
         appendToMessage(assistantMessage, data.delta);
       } else if (type === "tts_queued") {
         setStatus(`Voice chunk ${data.index}`);
       } else if (type === "audio") {
-        addAudioRow(data.url, data.index, data.seconds);
+        addAudioRow(data.url, `Chunk ${data.index}`, data.seconds);
         setStatus(`Playing chunk ${data.index}`);
         enqueuePlayback(data.url);
       } else if (type === "done") {
@@ -250,9 +264,10 @@ els.referenceForm.addEventListener("submit", async (event) => {
   try {
     const response = await fetch("/api/reference", { method: "POST", body: formData });
     if (!response.ok) throw new Error((await response.json()).detail || response.statusText);
+    const data = await response.json();
     await refreshStatus();
-    setStatus("Voice saved");
-    addMessage("Assistant", "Reference voice saved.");
+    setStatus(data.canned_building ? "Building fillers" : "Voice saved");
+    addMessage("Assistant", data.canned_building ? "Reference voice saved. Building fillers." : "Reference voice saved.");
   } catch (error) {
     addMessage("Assistant", error.message || "Voice save failed.");
     setStatus("Error");
@@ -316,13 +331,17 @@ async function sendRecording() {
       } else if (type === "start") {
         state.sessionId = data.session_id;
         localStorage.setItem("csm-session-id", state.sessionId);
+      } else if (type === "filler") {
+        addAudioRow(data.url, `Filler ${data.name}`, null);
+        setStatus(`Playing ${data.name}`);
+        enqueuePlayback(data.url);
       } else if (type === "text") {
         if (!assistantMessage) assistantMessage = addMessage("Assistant", "");
         appendToMessage(assistantMessage, data.delta);
       } else if (type === "tts_queued") {
         setStatus(`Voice chunk ${data.index}`);
       } else if (type === "audio") {
-        addAudioRow(data.url, data.index, data.seconds);
+        addAudioRow(data.url, `Chunk ${data.index}`, data.seconds);
         setStatus(`Playing chunk ${data.index}`);
         enqueuePlayback(data.url);
       } else if (type === "done") {
