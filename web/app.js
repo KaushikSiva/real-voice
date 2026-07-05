@@ -229,7 +229,17 @@ els.referenceForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const file = els.referenceAudio.files[0];
   const transcript = els.referenceText.value.trim();
-  if (!file || !transcript || state.busy) return;
+  if (state.busy) return;
+  if (!file) {
+    addMessage("Assistant", "Choose a reference audio file first.");
+    setStatus("Voice not saved");
+    return;
+  }
+  if (!transcript) {
+    addMessage("Assistant", "Enter the exact words spoken in the reference clip.");
+    setStatus("Voice not saved");
+    return;
+  }
 
   setBusy(true);
   setStatus("Saving voice");
@@ -242,6 +252,7 @@ els.referenceForm.addEventListener("submit", async (event) => {
     if (!response.ok) throw new Error((await response.json()).detail || response.statusText);
     await refreshStatus();
     setStatus("Voice saved");
+    addMessage("Assistant", "Reference voice saved.");
   } catch (error) {
     addMessage("Assistant", error.message || "Voice save failed.");
     setStatus("Error");
